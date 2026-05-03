@@ -1,28 +1,37 @@
+import os
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from prometheus_client import make_asgi_app
 from shared.config import settings
 from shared.logging import setup_logging
 from app.core.database import init_db
-from app.middleware.security import SecurityHeadersMiddleware
-from app.middleware.rate_limit import RateLimitMiddleware
 
 import app.models  # noqa: F401
 
 setup_logging("backend")
 logger = logging.getLogger("bgbot")
 
+IS_DEV = os.environ.get("ENVIRONMENT", "development") == "development"
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("=" * 50)
     logger.info("BG-BOT v5 API Starting")
+    logger.info(f"Mode: {'DEV (auto-login)' if IS_DEV else 'PRODUCTION'}")
     await init_db()
     logger.info("Database connected")
+
+    # Auto-seed dev user
+    if IS_DEV:
+        from app.core.dev_seed import seed_dev_user
+        await seed_dev_user()
+        logger.info("Dev user seeded")
+
     logger.info("=" * 50)
     yield
+
     try:
         from app.core.redis import redis_client
         await redis_client.close()
@@ -39,24 +48,39 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="BG-BOT v5", version="5.0.0", lifespan=lifespan)
 
 # Middleware
-try:
-    from app.middleware.metrics import MetricsMiddleware
-    app.add_middleware(MetricsMiddleware)
-except ImportError:
-    logger.warning("MetricsMiddleware not found, skipping")
-
-app.add_middleware(RateLimitMiddleware, max_req=settings.MAX_REQUESTS_PER_MINUTE)
-app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.FRONTEND_URL, "http://localhost:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Security headers
+from app.middleware.security import SecurityHeadersMiddleware
+app.add_middleware(SecurityHeadersMiddleware)
+
+# Rate limit (skip in dev)
+if not IS_DEV:
+    from app.middleware.rate_limit import RateLimitMiddleware
+    app.add_middleware(RateLimitMiddleware, max_req=settings.MAX_REQUESTS_PER_MINUTE)
+
+# Metrics
+try:
+    from app.middleware.metrics import MetricsMiddleware
+    app.add_middleware(MetricsMiddleware)
+except ImportError:
+    pass
+
+# DEV: Auto-login middleware (injects auth token)
+if IS_DEV:
+    from app.middleware.dev_auth import DevAutoLoginMiddleware
+    app.add_middleware(DevAutoLoginMiddleware)
+    logger.info("Auto-login middleware enabled")
+
 # Prometheus
 try:
+    from prometheus_client import make_asgi_app
     metrics_app = make_asgi_app()
     app.mount("/metrics", metrics_app)
 except Exception:
@@ -75,7 +99,6 @@ app.include_router(bot_router)
 app.include_router(backtest_router)
 app.include_router(ws_router)
 
-# Optional routes
 try:
     from app.routes.oauth import router as oauth_router
     app.include_router(oauth_router)
@@ -91,7 +114,7 @@ except ImportError:
 
 @app.get("/health")
 async def health():
-    checks = {"status": "ok", "version": "5.0.0"}
+    checks = {"status": "ok", "version": "5.0.0", "mode": "dev" if IS_DEV else "production"}
     try:
         from app.core.redis import redis_client
         await redis_client.ping()
